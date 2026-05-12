@@ -10,3 +10,5 @@ down -v, prune --volumes, recursive chown/chmod/rm, or media/config
 moves without John's explicit approval of exact scope.
 
 "Notes" means the Tier 3 SilverBullet wiki at notes.fritter.lol; use the `silverbullet-notes` skill when reading or writing stable reference notes.
+
+Gizmo's workspace backup repo is `/home/seeduser/gizmo-workspace` -> `github.com/john-fritter/gizmo-workspace`; sync and push it after changing mutable Gizmo state.
