@@ -1193,6 +1193,23 @@ class TestMessageRouting:
         adapter.handle_message.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_leading_space_slash_text_is_routed_as_command(self, adapter):
+        """A leading space lets Slack users send slash commands as message text."""
+        event = {
+            "text": " /model kimi-k2.6 --provider ollama-cloud",
+            "user": "U_USER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000001",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.COMMAND
+        assert msg_event.text == "/model kimi-k2.6 --provider ollama-cloud"
+
+    @pytest.mark.asyncio
     async def test_channel_message_requires_mention(self, adapter):
         """Channel messages without a bot mention should be ignored."""
         event = {

@@ -2024,10 +2024,15 @@ class SlackAdapter(BasePlatformAdapter):
             if thread_context:
                 text = thread_context + text
 
-        # Determine message type
+        # Determine message type. Slack intercepts native slash commands before
+        # they reach message events, so users can type a single leading space
+        # (" /model") to send the command as normal text. Treat that as a
+        # command while preserving ordinary leading whitespace in non-commands.
         msg_type = MessageType.TEXT
-        if (original_text or "").startswith("/"):
+        raw_command_text = (original_text or "").lstrip(" ")
+        if raw_command_text.startswith("/"):
             msg_type = MessageType.COMMAND
+            text = raw_command_text
 
         # Handle file attachments
         media_urls = []
