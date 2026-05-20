@@ -46,6 +46,44 @@ from agent.models_dev import (
 logger = logging.getLogger(__name__)
 
 
+def _load_model_enabled_providers() -> set[str]:
+    """Return the configured /model provider allowlist, if any.
+
+    The key intentionally lives under ``model`` because it affects the model
+    picker and slash model resolution UX, not low-level credential loading.
+    Empty or absent means no filter for backwards compatibility.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(model_cfg, dict):
+            return set()
+        raw = (
+            model_cfg.get("enabled_providers")
+            or model_cfg.get("allowed_providers")
+            or model_cfg.get("provider_allowlist")
+            or []
+        )
+        if isinstance(raw, str):
+            raw = [part.strip() for part in raw.split(",")]
+        if not isinstance(raw, (list, tuple, set)):
+            return set()
+        allowed = {str(item).strip().lower() for item in raw if str(item).strip()}
+        # Custom providers may surface as either the named slug (ollama-cloud)
+        # or the canonical custom:<name> slug. Accept either spelling.
+        expanded = set(allowed)
+        for slug in allowed:
+            if slug.startswith("custom:"):
+                expanded.add(slug.split(":", 1)[1])
+            else:
+                expanded.add(f"custom:{slug}")
+        return expanded
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # Non-agentic model warning
 # ---------------------------------------------------------------------------
@@ -1732,6 +1770,13 @@ def list_authenticated_providers(
             })
             seen_slugs.add(slug.lower())
             _section4_emitted_slugs.add(slug.lower())
+
+    enabled_providers = _load_model_enabled_providers()
+    if enabled_providers:
+        results = [
+            r for r in results
+            if str(r.get("slug", "")).strip().lower() in enabled_providers
+        ]
 
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
