@@ -32,6 +32,7 @@ from tools.send_message_tool import (
     _parse_target_ref,
     _send_matrix_via_adapter,
     _send_signal,
+    _send_slack,
     _send_telegram,
     _send_to_platform,
     send_message_tool,
@@ -377,8 +378,8 @@ class TestSendMessageTool:
             user_id="user-123",
         )
 
-    def test_media_tag_outside_allowed_roots_is_not_sent(self, tmp_path):
-        config, telegram_cfg = _make_config()
+    def test_media_tag_outside_allowed_roots_fails_loudly(self, tmp_path):
+        config, _telegram_cfg = _make_config()
         secret = tmp_path / "secret.pdf"
         secret.write_bytes(b"%PDF secret")
 
@@ -397,16 +398,10 @@ class TestSendMessageTool:
                 )
             )
 
-        assert result["success"] is True
-        send_mock.assert_awaited_once_with(
-            Platform.TELEGRAM,
-            telegram_cfg,
-            "12345",
-            "hello",
-            thread_id=None,
-            media_files=[],
-            force_document=False,
-        )
+        assert "error" in result
+        assert "Refusing to send" in result["error"]
+        assert "outside allowed delivery roots" in result["error"]
+        send_mock.assert_not_awaited()
 
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()
@@ -434,6 +429,114 @@ class TestSendMessageTool:
         assert "error" in result
         assert leaked not in result["error"]
         assert "access_token=***" in result["error"]
+
+
+class TestSendSlackMediaDelivery:
+    class _Resp:
+        def __init__(self, status=200, data=None, text="OK"):
+            self.status = status
+            self._data = data or {"ok": True}
+            self._text = text
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def json(self):
+            return self._data
+
+        async def text(self):
+            return self._text
+
+    class _Session:
+        def __init__(self):
+            self.calls = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if url.endswith("/files.getUploadURLExternal"):
+                return TestSendSlackMediaDelivery._Resp(
+                    data={"ok": True, "upload_url": "https://upload.example/F123", "file_id": "F123"}
+                )
+            if url == "https://upload.example/F123":
+                return TestSendSlackMediaDelivery._Resp(data={"ok": True})
+            if url.endswith("/files.completeUploadExternal"):
+                return TestSendSlackMediaDelivery._Resp(
+                    data={"ok": True, "files": [{"id": "F123", "permalink": "https://slack/files/F123"}]}
+                )
+            if url.endswith("/conversations.replies"):
+                return TestSendSlackMediaDelivery._Resp(
+                    data={"ok": True, "messages": [{"files": [{"id": "F123"}]}]}
+                )
+            return TestSendSlackMediaDelivery._Resp(status=404, data={"ok": False, "error": "unexpected_url"})
+
+    def test_external_upload_completes_and_verifies_thread_attachment(self, tmp_path):
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF fake")
+        session = self._Session()
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = asyncio.run(
+                _send_slack(
+                    "xoxb-test",
+                    "C123ABCDEF",
+                    "Report attached",
+                    thread_id="1778528101.080979",
+                    media_files=[(str(report), False)],
+                )
+            )
+
+        assert result["success"] is True
+        assert result["file_ids"] == ["F123"]
+        assert result["verified"] is True
+        assert result["permalink"] == "https://slack/files/F123"
+        urls = [call[0] for call in session.calls]
+        assert urls == [
+            "https://slack.com/api/files.getUploadURLExternal",
+            "https://upload.example/F123",
+            "https://slack.com/api/files.completeUploadExternal",
+            "https://slack.com/api/conversations.replies",
+        ]
+        complete_payload = session.calls[2][1]["json"]
+        assert complete_payload["channel_id"] == "C123ABCDEF"
+        assert complete_payload["thread_ts"] == "1778528101.080979"
+        assert complete_payload["initial_comment"] == "Report attached"
+        assert complete_payload["files"] == [{"id": "F123", "title": "report.pdf"}]
+
+    def test_external_upload_errors_if_thread_verification_misses_file(self, tmp_path):
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF fake")
+        session = self._Session()
+        original_post = session.post
+
+        def post_missing_file(url, **kwargs):
+            if url.endswith("/conversations.replies"):
+                session.calls.append((url, kwargs))
+                return TestSendSlackMediaDelivery._Resp(data={"ok": True, "messages": [{"files": []}]})
+            return original_post(url, **kwargs)
+
+        session.post = post_missing_file
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = asyncio.run(
+                _send_slack(
+                    "xoxb-test",
+                    "C123ABCDEF",
+                    "Report attached",
+                    thread_id="1778528101.080979",
+                    media_files=[(str(report), False)],
+                )
+            )
+
+        assert "error" in result
+        assert "verification did not find" in result["error"]
 
 
 class TestSendTelegramMediaDelivery:
@@ -590,6 +693,61 @@ class TestSendToPlatformChunking:
             "***",
             "C123",
             "*hello* from <https://example.com|Hermes>",
+        )
+
+    def test_slack_text_send_preserves_thread_id(self, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "thread reply",
+                    thread_id="1778528101.080979",
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            "***",
+            "C123",
+            "thread reply",
+            thread_id="1778528101.080979",
+            media_files=[],
+        )
+
+    def test_slack_media_send_preserves_thread_id_and_attachments(self, tmp_path, monkeypatch):
+        _ensure_slack_mock(monkeypatch)
+        import gateway.platforms.slack as slack_mod
+        monkeypatch.setattr(slack_mod, "SLACK_AVAILABLE", True)
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF fake")
+        send = AsyncMock(return_value={"success": True, "file_ids": ["F123"], "verified": True})
+
+        with patch("tools.send_message_tool._send_slack", send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.SLACK,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "C123",
+                    "Report attached",
+                    thread_id="1778528101.080979",
+                    media_files=[(str(report), False)],
+                )
+            )
+
+        assert result["success"] is True
+        send.assert_awaited_once_with(
+            "***",
+            "C123",
+            "Report attached",
+            thread_id="1778528101.080979",
+            media_files=[(str(report), False)],
         )
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
