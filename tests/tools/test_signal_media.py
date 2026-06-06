@@ -20,6 +20,9 @@ def _make_httpx_mock():
     class Proxy:
         pass
 
+    class URL:
+        pass
+
     class MockResp:
         status_code = 200
         def json(self):
@@ -39,6 +42,7 @@ def _make_httpx_mock():
     httpx_mock.AsyncClient = lambda timeout=None: MockClient()
     httpx_mock.AsyncBaseTransport = AsyncBaseTransport  # Needed by Telegram adapter
     httpx_mock.Proxy = Proxy  # Needed by telegram-bot library
+    setattr(httpx_mock, "URL", URL)  # Needed by telegram-bot/httpx compatibility checks
     return httpx_mock
 
 
@@ -122,8 +126,8 @@ class TestSendSignalMediaRestrictions:
 
             assert result["success"] is True
 
-    def test_non_media_platforms_reject_text_only_media(self):
-        """Slack should reject text-only media (no MESSAGE content)."""
+    def test_slack_media_missing_file_fails_loudly(self):
+        """Slack MEDIA delivery is supported and missing files produce upload errors."""
         import httpx
         if not hasattr(httpx, 'Proxy') or not hasattr(httpx, 'URL'):
             pytest.skip("httpx type annotations incompatible with telegram library")
@@ -145,14 +149,14 @@ class TestSendSignalMediaRestrictions:
         )
 
         assert "error" in result
-        assert "only supported for" in result["error"]
+        assert "attachment path does not exist" in result["error"]
 
 
-class TestSendSignalMediaWarningMessages:
-    """Test warning messages are updated to include signal."""
+class TestSendSlackMediaSupport:
+    """Slack media sends should be native uploads, not text-only warnings."""
 
-    def test_warning_includes_signal_when_media_omitted(self):
-        """Non-media platforms should show a warning mentioning signal in the supported list."""
+    def test_slack_media_result_has_no_omission_warning(self):
+        """Successful Slack media delivery should not warn that attachments were omitted."""
         import httpx
         if not hasattr(httpx, 'Proxy') or not hasattr(httpx, 'URL'):
             pytest.skip("httpx type annotations incompatible with telegram library")
@@ -162,8 +166,8 @@ class TestSendSignalMediaWarningMessages:
         config.platforms = {Platform.SLACK: MagicMock(enabled=True)}
         config.get_home_channel.return_value = None
 
-        # Mock _send_slack so it succeeds -> then warning gets attached to result
-        with patch("tools.send_message_tool._send_slack", new=AsyncMock(return_value={"success": True})):
+        # Mock _send_slack so native upload succeeds.
+        with patch("tools.send_message_tool._send_slack", new=AsyncMock(return_value={"success": True, "file_ids": ["F1"]})):
             result = asyncio.run(
                 _send_to_platform(
                     Platform.SLACK,
@@ -174,10 +178,8 @@ class TestSendSignalMediaWarningMessages:
                 )
             )
 
-        assert result.get("warnings") is not None
-        # Check that the warning mentions signal as supported
-        found = any("signal" in w.lower() for w in result["warnings"])
-        assert found, f"Expected 'signal' in warnings but got: {result.get('warnings')}"
+        assert result["success"] is True
+        assert result.get("warnings") is None
 
 
 class TestSendSignalGroupChats:

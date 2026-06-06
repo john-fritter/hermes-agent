@@ -8,11 +8,13 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import ssl
 import time
 from email.utils import formatdate
+from pathlib import Path
 from typing import Dict, Optional
 
 from agent.redact import redact_sensitive_text
@@ -139,7 +141,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "message": {
                 "type": "string",
-                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/hermes/cache/img_xxx.jpg') in the message — the platform will deliver it as a native media attachment."
+                "description": "The message text to send. To send an image or file, include MEDIA:<local_path> for a file under a Hermes media cache or HERMES_MEDIA_ALLOW_DIRS — the platform will deliver it as a native media attachment."
             }
         },
         "required": []
@@ -251,6 +253,15 @@ def _handle_send(args):
     force_document_attachments = "[[as_document]]" in message
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+    filtered_media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    if media_files and len(filtered_media_files) != len(media_files):
+        dropped = len(media_files) - len(filtered_media_files)
+        return json.dumps(_error(
+            f"Refusing to send: {dropped} MEDIA attachment path(s) were outside allowed delivery roots or missing. "
+            f"Move generated files under the Hermes document/media cache (for example ~/.hermes/cache/documents) "
+            f"or configure HERMES_MEDIA_ALLOW_DIRS explicitly."
+        ))
+    media_files = filtered_media_files
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
@@ -563,7 +574,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     """
     from gateway.config import Platform
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
-    from gateway.platforms.discord import DiscordAdapter
     from gateway.platforms.slack import SlackAdapter
 
     # Telegram adapter import is optional (requires python-telegram-bot)
@@ -589,10 +599,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         except Exception:
             logger.debug("Failed to apply Slack mrkdwn formatting in _send_to_platform", exc_info=True)
 
-    # Platform message length limits (from adapter class attributes)
+    # Platform message length limits (from adapter class attributes for
+    # built-in platforms; from PlatformEntry.max_message_length for plugins).
     _MAX_LENGTHS = {
         Platform.TELEGRAM: TelegramAdapter.MAX_MESSAGE_LENGTH if _telegram_available else 4096,
-        Platform.DISCORD: DiscordAdapter.MAX_MESSAGE_LENGTH,
         Platform.SLACK: SlackAdapter.MAX_MESSAGE_LENGTH,
     }
     if _feishu_available:
@@ -642,17 +652,27 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
-    # --- Discord: special handling for media attachments ---
+    # --- Discord: chunked delivery via the registry's standalone_sender_fn.
+    # The plugin's ``_standalone_send`` (registered in
+    # plugins/platforms/discord/adapter.py) handles forum channels, threads,
+    # and multipart media uploads.  ``_send_via_adapter`` tries the live
+    # in-process adapter first via ``adapter.send()``, but Discord's elif
+    # historically went straight to the HTTP path; we preserve that by
+    # explicitly invoking the registry hook here so behavior is unchanged.
     if platform == Platform.DISCORD:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get("discord")
+        if entry is None or entry.standalone_sender_fn is None:
+            return {"error": "Discord plugin not registered or missing standalone_sender_fn"}
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _send_discord(
-                pconfig.token,
+            result = await entry.standalone_sender_fn(
+                pconfig,
                 chat_id,
                 chunk,
-                media_files=media_files if is_last else [],
                 thread_id=thread_id,
+                media_files=media_files if is_last else [],
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -724,11 +744,31 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Slack: native thread-aware text and external-upload media support ---
+    if platform == Platform.SLACK:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            if thread_id or media_files:
+                result = await _send_slack(
+                    pconfig.token,
+                    chat_id,
+                    chunk,
+                    thread_id=thread_id,
+                    media_files=media_files if is_last else [],
+                )
+            else:
+                result = await _send_slack(pconfig.token, chat_id, chunk)
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
+                f"send_message MEDIA delivery is currently only supported for slack, telegram, discord, matrix, weixin, signal, yuanbao and feishu; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -736,14 +776,12 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao and feishu"
+            "native send_message media delivery is currently only supported for slack, telegram, discord, matrix, weixin, signal, yuanbao and feishu"
         )
 
     last_result = None
     for chunk in chunks:
-        if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk)
-        elif platform == Platform.WHATSAPP:
+        if platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
@@ -1026,246 +1064,175 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-def _derive_forum_thread_name(message: str) -> str:
-    """Derive a thread name from the first line of the message, capped at 100 chars."""
-    first_line = message.strip().split("\n", 1)[0].strip()
-    # Strip common markdown heading prefixes
-    first_line = first_line.lstrip("#").strip()
-    if not first_line:
-        first_line = "New Post"
-    return first_line[:100]
+async def _send_slack(token, chat_id, message, *, thread_id=None, media_files=None):
+    """Send via Slack Web API.
 
-
-# Process-local cache for Discord channel-type probes.  Avoids re-probing the
-# same channel on every send when the directory cache has no entry (e.g. fresh
-# install, or channel created after the last directory build).
-_DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
-
-
-def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
-    _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
-
-
-def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
-    return _DISCORD_CHANNEL_TYPE_PROBE_CACHE.get(str(chat_id))
-
-
-async def _send_discord(token, chat_id, message, thread_id=None, media_files=None):
-    """Send a single message via Discord REST API (no websocket client needed).
-
-    Chunking is handled by _send_to_platform() before this is called.
-
-    When thread_id is provided, the message is sent directly to that thread
-    via the /channels/{thread_id}/messages endpoint.
-
-    Media files are uploaded one-by-one via multipart/form-data after the
-    text message is sent (same pattern as Telegram).
-
-    Forum channels (type 15) reject POST /messages — a thread post is created
-    automatically via POST /channels/{id}/threads.  Media files are uploaded
-    as multipart attachments on the starter message of the new thread.
-
-    Channel type is resolved from the channel directory first, then a
-    process-local probe cache, and only as a last resort with a live
-    GET /channels/{id} probe (whose result is memoized).
+    Text-only sends use ``chat.postMessage``.  When MEDIA attachments are
+    present, use Slack's external upload flow so a successful result means an
+    actual Slack file was created, not merely a text message with a stripped
+    MEDIA tag.
     """
     try:
         import aiohttp
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
-    try:
-        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
-        _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
-        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        auth_headers = {"Authorization": f"Bot {token}"}
-        json_headers = {**auth_headers, "Content-Type": "application/json"}
-        media_files = media_files or []
-        last_data = None
-        warnings = []
 
-        # Thread endpoint: Discord threads are channels; send directly to the thread ID.
-        if thread_id:
-            url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
-        else:
-            # Check if the target channel is a forum channel (type 15).
-            # Forum channels reject POST /messages — create a thread post instead.
-            # Three-layer detection: directory cache → process-local probe
-            # cache → GET /channels/{id} probe (with result memoized).
-            _channel_type = None
-            try:
-                from gateway.channel_directory import lookup_channel_type
-                _channel_type = lookup_channel_type("discord", chat_id)
-            except Exception:
-                pass
+    async def _json_or_error(resp):
+        try:
+            return await resp.json()
+        except Exception:
+            body = await resp.text()
+            return {"ok": False, "error": f"non_json_response_{resp.status}: {body[:300]}"}
 
-            if _channel_type == "forum":
-                is_forum = True
-            elif _channel_type is not None:
-                is_forum = False
-            else:
-                cached = _probe_is_forum_cached(chat_id)
-                if cached is not None:
-                    is_forum = cached
-                else:
-                    is_forum = False
-                    try:
-                        info_url = f"https://discord.com/api/v10/channels/{chat_id}"
-                        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **_sess_kw) as info_sess:
-                            async with info_sess.get(info_url, headers=json_headers, **_req_kw) as info_resp:
-                                if info_resp.status == 200:
-                                    info = await info_resp.json()
-                                    is_forum = info.get("type") == 15
-                                    _remember_channel_is_forum(chat_id, is_forum)
-                    except Exception:
-                        logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
+    async def _post_slack_api(session, url, *, headers, req_kw, **kwargs):
+        async with session.post(url, headers=headers, **kwargs, **req_kw) as resp:
+            data = await _json_or_error(resp)
+            if resp.status >= 400:
+                return {"ok": False, "error": f"http_{resp.status}: {data.get('error', 'unknown')}"}
+            return data
 
-            if is_forum:
-                thread_name = _derive_forum_thread_name(message)
-                thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
-
-                # Filter to readable media files up front so we can pick the
-                # right code path (JSON vs multipart) before opening a session.
-                valid_media = []
-                for media_path, _is_voice in media_files:
-                    if not os.path.exists(media_path):
-                        warning = f"Media file not found, skipping: {media_path}"
-                        logger.warning(warning)
-                        warnings.append(warning)
-                        continue
-                    valid_media.append(media_path)
-
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60), **_sess_kw) as session:
-                    if valid_media:
-                        # Multipart: payload_json + files[N] creates a forum
-                        # thread with the starter message plus attachments in
-                        # a single API call.
-                        attachments_meta = [
-                            {"id": str(idx), "filename": os.path.basename(path)}
-                            for idx, path in enumerate(valid_media)
-                        ]
-                        starter_message = {"content": message, "attachments": attachments_meta}
-                        payload_json = json.dumps({"name": thread_name, "message": starter_message})
-
-                        form = aiohttp.FormData()
-                        form.add_field("payload_json", payload_json, content_type="application/json")
-
-                        # Buffer file bytes up front — aiohttp's FormData can
-                        # read lazily and we don't want handles closing under
-                        # it on retry.
-                        try:
-                            for idx, media_path in enumerate(valid_media):
-                                with open(media_path, "rb") as fh:
-                                    form.add_field(
-                                        f"files[{idx}]",
-                                        fh.read(),
-                                        filename=os.path.basename(media_path),
-                                    )
-                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
-                                if resp.status not in {200, 201}:
-                                    body = await resp.text()
-                                    return _error(f"Discord forum thread creation error ({resp.status}): {body}")
-                                data = await resp.json()
-                        except Exception as e:
-                            return _error(_sanitize_error_text(f"Discord forum thread upload failed: {e}"))
-                    else:
-                        # No media — simple JSON POST creates the thread with
-                        # just the text starter.
-                        async with session.post(
-                            thread_url,
-                            headers=json_headers,
-                            json={
-                                "name": thread_name,
-                                "message": {"content": message},
-                            },
-                            **_req_kw,
-                        ) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await resp.text()
-                                return _error(f"Discord forum thread creation error ({resp.status}): {body}")
-                            data = await resp.json()
-
-                thread_id_created = data.get("id")
-                starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
-                result = {
-                    "success": True,
-                    "platform": "discord",
-                    "chat_id": chat_id,
-                    "thread_id": thread_id_created,
-                    "message_id": starter_msg_id,
-                }
-                if warnings:
-                    result["warnings"] = warnings
-                return result
-
-            url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
-
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            # Send text message (skip if empty and media is present)
-            if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in {200, 201}:
-                        body = await resp.text()
-                        return _error(f"Discord API error ({resp.status}): {body}")
-                    last_data = await resp.json()
-
-            # Send each media file as a separate multipart upload
-            for media_path, _is_voice in media_files:
-                if not os.path.exists(media_path):
-                    warning = f"Media file not found, skipping: {media_path}"
-                    logger.warning(warning)
-                    warnings.append(warning)
-                    continue
-                try:
-                    form = aiohttp.FormData()
-                    filename = os.path.basename(media_path)
-                    with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await resp.text()
-                                warning = _sanitize_error_text(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = await resp.json()
-                except Exception as e:
-                    warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
-                    logger.error(warning)
-                    warnings.append(warning)
-
-        if last_data is None:
-            error = "No deliverable text or media remained after processing"
-            if warnings:
-                return {"error": error, "warnings": warnings}
-            return {"error": error}
-
-        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": last_data.get("id")}
-        if warnings:
-            result["warnings"] = warnings
-        return result
-    except Exception as e:
-        return _error(f"Discord send failed: {e}")
-
-
-async def _send_slack(token, chat_id, message):
-    """Send via Slack Web API."""
-    try:
-        import aiohttp
-    except ImportError:
-        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url()
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
-        url = "https://slack.com/api/chat.postMessage"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            payload = {"channel": chat_id, "text": message, "mrkdwn": True}
-            async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
-                data = await resp.json()
+        auth_headers = {"Authorization": f"Bearer {token}"}
+        json_headers = {**auth_headers, "Content-Type": "application/json; charset=utf-8"}
+        media_files = media_files or []
+        timeout_seconds = max(60, 30 + 60 * len(media_files))
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_seconds), **_sess_kw) as session:
+            if not media_files:
+                url = "https://slack.com/api/chat.postMessage"
+                payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+                if thread_id:
+                    payload["thread_ts"] = thread_id
+                data = await _post_slack_api(
+                    session,
+                    url,
+                    headers=json_headers,
+                    req_kw=_req_kw,
+                    json=payload,
+                )
                 if data.get("ok"):
-                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
+                    return {
+                        "success": True,
+                        "platform": "slack",
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                        "message_id": data.get("ts"),
+                    }
                 return _error(f"Slack API error: {data.get('error', 'unknown')}")
+
+            uploaded_files = []
+            for media_path, _is_voice in media_files:
+                path = Path(media_path)
+                if not path.is_file():
+                    return _error(f"Slack file upload failed: attachment path does not exist or is not a file: {media_path}")
+                size = path.stat().st_size
+                if size <= 0:
+                    return _error(f"Slack file upload failed: attachment is empty: {path.name}")
+
+                get_url_data = await _post_slack_api(
+                    session,
+                    "https://slack.com/api/files.getUploadURLExternal",
+                    headers=auth_headers,
+                    req_kw=_req_kw,
+                    data={"filename": path.name, "length": str(size)},
+                )
+                if not get_url_data.get("ok"):
+                    return _error(f"Slack getUploadURLExternal failed: {get_url_data.get('error', 'unknown')}")
+
+                upload_url = get_url_data.get("upload_url")
+                file_id = get_url_data.get("file_id")
+                if not upload_url or not file_id:
+                    return _error("Slack getUploadURLExternal failed: missing upload_url or file_id")
+
+                mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+                with path.open("rb") as fp:
+                    form = aiohttp.FormData()
+                    form.add_field(
+                        "file",
+                        fp,
+                        filename=path.name,
+                        content_type=mime_type,
+                    )
+                    async with session.post(upload_url, data=form, **_req_kw) as upload_resp:
+                        if upload_resp.status >= 400:
+                            body = await upload_resp.text()
+                            return _error(f"Slack file byte upload failed ({upload_resp.status}): {body[:300]}")
+
+                uploaded_files.append({"id": file_id, "title": path.name})
+
+            complete_payload = {
+                "files": uploaded_files,
+                "channel_id": chat_id,
+            }
+            if thread_id:
+                complete_payload["thread_ts"] = thread_id
+            if message and message.strip():
+                complete_payload["initial_comment"] = message
+
+            complete_data = await _post_slack_api(
+                session,
+                "https://slack.com/api/files.completeUploadExternal",
+                headers=json_headers,
+                req_kw=_req_kw,
+                json=complete_payload,
+            )
+            if not complete_data.get("ok"):
+                return _error(f"Slack completeUploadExternal failed: {complete_data.get('error', 'unknown')}")
+
+            file_ids = [item["id"] for item in uploaded_files]
+            result = {
+                "success": True,
+                "platform": "slack",
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "file_ids": file_ids,
+                "verified": False,
+            }
+            files = complete_data.get("files")
+            if isinstance(files, list) and files:
+                permalink = files[0].get("permalink") or files[0].get("url_private")
+                if permalink:
+                    result["permalink"] = permalink
+
+            if thread_id:
+                seen_file_ids = set()
+                cursor = None
+                for _page in range(10):
+                    replies_payload = {"channel": chat_id, "ts": thread_id, "limit": "200"}
+                    if cursor:
+                        replies_payload["cursor"] = cursor
+                    replies_data = await _post_slack_api(
+                        session,
+                        "https://slack.com/api/conversations.replies",
+                        headers=auth_headers,
+                        req_kw=_req_kw,
+                        data=replies_payload,
+                    )
+                    if not replies_data.get("ok"):
+                        return _error(f"Slack upload completed but thread verification failed: {replies_data.get('error', 'unknown')}")
+                    for msg in replies_data.get("messages", []) or []:
+                        for file_info in msg.get("files", []) or []:
+                            fid = file_info.get("id")
+                            if fid:
+                                seen_file_ids.add(fid)
+                    if all(fid in seen_file_ids for fid in file_ids):
+                        break
+                    metadata = replies_data.get("response_metadata") or {}
+                    cursor = (metadata.get("next_cursor") or "").strip()
+                    if not cursor:
+                        break
+                missing = [fid for fid in file_ids if fid not in seen_file_ids]
+                if missing:
+                    return _error(
+                        "Slack upload completed but verification did not find uploaded file(s) "
+                        f"in thread {thread_id}: {', '.join(missing)}"
+                    )
+                result["verified"] = True
+
+            return result
     except Exception as e:
         return _error(f"Slack send failed: {e}")
 
