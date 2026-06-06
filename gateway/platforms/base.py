@@ -2217,6 +2217,44 @@ class BasePlatformAdapter(ABC):
         return safe_media
 
     @staticmethod
+    def rejected_media_delivery_paths(media_files) -> List[str]:
+        """Return MEDIA directive paths that cannot be safely delivered."""
+        rejected: List[str] = []
+        for media_path, _is_voice in media_files or []:
+            raw_path = str(media_path)
+            if not validate_media_delivery_path(raw_path):
+                rejected.append(raw_path)
+        return rejected
+
+    @staticmethod
+    def format_slack_media_delivery_error(
+        *,
+        rejected_paths: Optional[List[str]] = None,
+        upload_path: Optional[str] = None,
+        upload_error: Optional[str] = None,
+    ) -> str:
+        """Build a user-visible Slack media failure notice."""
+        if rejected_paths:
+            joined = ", ".join(rejected_paths)
+            return (
+                "Slack file attachment failed: MEDIA path is not deliverable: "
+                f"{joined}. Use a Hermes document cache path under "
+                "~/.hermes/cache/documents/ or perform Slack external upload "
+                "and verify the file_id."
+            )
+        if upload_path:
+            detail = f": {upload_error}" if upload_error else ""
+            return (
+                "Slack file attachment failed: upload failed for "
+                f"{upload_path}{detail}. Use Slack external upload and verify "
+                "the file_id."
+            )
+        return "Slack file attachment failed."
+
+    def _is_slack_platform(self) -> bool:
+        return _platform_name(self.platform) == "slack"
+
+    @staticmethod
     def filter_local_delivery_paths(file_paths) -> List[str]:
         """Drop unsafe bare local file paths and normalize accepted paths."""
         safe_paths: List[str] = []
@@ -2268,7 +2306,7 @@ class BasePlatformAdapter(ABC):
         # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
         # and quoted/backticked paths for LLM-formatted outputs.
         media_pattern = re.compile(
-            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|(?:~/|/)\S+(?:[^\S\n]+\S+)*?\.(?:png|jpe?g|gif|webp|mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|txt|md|csv|apk|ipa)(?=[\s`"',;:)\]}]|$))[`"']?'''
         )
         for match in media_pattern.finditer(content):
             path = match.group("path").strip()
@@ -3275,6 +3313,11 @@ class BasePlatformAdapter(ABC):
 
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
+                rejected_media_paths = (
+                    self.rejected_media_delivery_paths(media_files)
+                    if self._is_slack_platform()
+                    else []
+                )
                 media_files = self.filter_media_delivery_paths(media_files)
 
                 # Extract image URLs and send them as native platform attachments
@@ -3292,6 +3335,11 @@ class BasePlatformAdapter(ABC):
                 local_files = self.filter_local_delivery_paths(local_files)
                 if local_files:
                     logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
+                if rejected_media_paths:
+                    media_error = self.format_slack_media_delivery_error(
+                        rejected_paths=rejected_media_paths,
+                    )
+                    text_content = f"{text_content}\n\n{media_error}".strip()
                 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -3466,8 +3514,26 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            if self._is_slack_platform():
+                                await self.send(
+                                    chat_id=event.source.chat_id,
+                                    content=self.format_slack_media_delivery_error(
+                                        upload_path=media_path,
+                                        upload_error=media_result.error,
+                                    ),
+                                    metadata=_thread_metadata,
+                                )
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        if self._is_slack_platform():
+                            await self.send(
+                                chat_id=event.source.chat_id,
+                                content=self.format_slack_media_delivery_error(
+                                    upload_path=media_path,
+                                    upload_error=str(media_err),
+                                ),
+                                metadata=_thread_metadata,
+                            )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -3476,19 +3542,41 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_thread_metadata,
                             )
+                        if (
+                            self._is_slack_platform()
+                            and file_result is not None
+                            and not getattr(file_result, "success", False)
+                        ):
+                            await self.send(
+                                chat_id=event.source.chat_id,
+                                content=self.format_slack_media_delivery_error(
+                                    upload_path=file_path,
+                                    upload_error=getattr(file_result, "error", None),
+                                ),
+                                metadata=_thread_metadata,
+                            )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        if self._is_slack_platform():
+                            await self.send(
+                                chat_id=event.source.chat_id,
+                                content=self.format_slack_media_delivery_error(
+                                    upload_path=file_path,
+                                    upload_error=str(file_err),
+                                ),
+                                metadata=_thread_metadata,
+                            )
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

@@ -11249,12 +11249,24 @@ class GatewayRunner:
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
             media_files, _ = adapter.extract_media(response)
+            rejected_media_paths = []
+            if getattr(event.source.platform, "value", event.source.platform) == "slack":
+                rejected_media_paths = BasePlatformAdapter.rejected_media_delivery_paths(media_files)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             _, cleaned = adapter.extract_images(response)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+
+            if rejected_media_paths:
+                await adapter.send(
+                    chat_id=event.source.chat_id,
+                    content=BasePlatformAdapter.format_slack_media_delivery_error(
+                        rejected_paths=rejected_media_paths,
+                    ),
+                    metadata=_thread_meta,
+                )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -11297,43 +11309,87 @@ class GatewayRunner:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        media_result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        media_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        media_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                    if (
+                        getattr(event.source.platform, "value", event.source.platform) == "slack"
+                        and media_result is not None
+                        and not getattr(media_result, "success", False)
+                    ):
+                        await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content=BasePlatformAdapter.format_slack_media_delivery_error(
+                                upload_path=media_path,
+                                upload_error=getattr(media_result, "error", None),
+                            ),
+                            metadata=_thread_meta,
+                        )
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    if getattr(event.source.platform, "value", event.source.platform) == "slack":
+                        await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content=BasePlatformAdapter.format_slack_media_delivery_error(
+                                upload_path=media_path,
+                                upload_error=str(e),
+                            ),
+                            metadata=_thread_meta,
+                        )
 
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        file_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
+                        file_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
+                    if (
+                        getattr(event.source.platform, "value", event.source.platform) == "slack"
+                        and file_result is not None
+                        and not getattr(file_result, "success", False)
+                    ):
+                        await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content=BasePlatformAdapter.format_slack_media_delivery_error(
+                                upload_path=file_path,
+                                upload_error=getattr(file_result, "error", None),
+                            ),
+                            metadata=_thread_meta,
+                        )
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    if getattr(event.source.platform, "value", event.source.platform) == "slack":
+                        await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content=BasePlatformAdapter.format_slack_media_delivery_error(
+                                upload_path=file_path,
+                                upload_error=str(e),
+                            ),
+                            metadata=_thread_meta,
+                        )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
@@ -11548,8 +11604,16 @@ class GatewayRunner:
             if response:
                 media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
+                rejected_media_paths = []
+                if getattr(source.platform, "value", source.platform) == "slack":
+                    rejected_media_paths = BasePlatformAdapter.rejected_media_delivery_paths(media_files)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
+                if rejected_media_paths:
+                    media_error = BasePlatformAdapter.format_slack_media_delivery_error(
+                        rejected_paths=rejected_media_paths,
+                    )
+                    text_content = f"{text_content}\n\n{media_error}".strip()
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
@@ -11582,12 +11646,34 @@ class GatewayRunner:
                 # Send media files
                 for media_path, _is_voice in (media_files or []):
                     try:
-                        await adapter.send_document(
+                        media_result = await adapter.send_document(
                             chat_id=source.chat_id,
                             file_path=media_path,
                             metadata=_thread_metadata,
                         )
+                        if (
+                            getattr(source.platform, "value", source.platform) == "slack"
+                            and media_result is not None
+                            and not getattr(media_result, "success", False)
+                        ):
+                            await adapter.send(
+                                chat_id=source.chat_id,
+                                content=BasePlatformAdapter.format_slack_media_delivery_error(
+                                    upload_path=media_path,
+                                    upload_error=getattr(media_result, "error", None),
+                                ),
+                                metadata=_thread_metadata,
+                            )
                     except Exception:
+                        if getattr(source.platform, "value", source.platform) == "slack":
+                            await adapter.send(
+                                chat_id=source.chat_id,
+                                content=BasePlatformAdapter.format_slack_media_delivery_error(
+                                    upload_path=media_path,
+                                    upload_error="unknown error",
+                                ),
+                                metadata=_thread_metadata,
+                            )
                         pass
             else:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")

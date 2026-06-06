@@ -50,6 +50,21 @@ def _event(thread_id=None):
     )
 
 
+def _slack_event(thread_id=None):
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_type="thread",
+        thread_id=thread_id,
+    )
+    return MessageEvent(
+        text="make report",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="user-ts",
+    )
+
+
 def _allowed_media_path(tmp_path, monkeypatch, name):
     root = tmp_path / "media-cache"
     media_file = root / name
@@ -254,3 +269,44 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
 
     adapter.send_document.assert_not_awaited()
     adapter.send_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_streaming_slack_unsafe_media_path_posts_visible_error(tmp_path, monkeypatch):
+    event = _slack_event(thread_id="parent-ts")
+    unsafe = tmp_path / "outside" / "report.md"
+    unsafe.parent.mkdir()
+    unsafe.write_text("report", encoding="utf-8")
+    allowed_root = tmp_path / "media-cache"
+    allowed_root.mkdir()
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (allowed_root,),
+    )
+    adapter = SimpleNamespace(
+        name="slack",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "parent-ts"}),
+        f"MEDIA:{unsafe}",
+        event,
+        adapter,
+    )
+
+    adapter.send_document.assert_not_awaited()
+    adapter.send_voice.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    call_kwargs = adapter.send.await_args.kwargs
+    assert call_kwargs["chat_id"] == "C123"
+    assert call_kwargs["metadata"] == {"thread_id": "parent-ts"}
+    assert "Slack file attachment failed" in call_kwargs["content"]
+    assert f"MEDIA path is not deliverable: {unsafe}" in call_kwargs["content"]

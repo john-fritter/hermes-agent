@@ -11,6 +11,7 @@ We mock the slack modules at import time to avoid collection errors.
 import asyncio
 import os
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
@@ -23,6 +24,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     is_host_excluded_by_no_proxy,
 )
+from gateway.session import SessionSource, build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -538,22 +540,24 @@ class TestSendDocument:
         assert "Not connected" in result.error
 
     @pytest.mark.asyncio
-    async def test_send_document_api_error_falls_back(self, adapter, tmp_path):
+    async def test_send_document_api_error_returns_failure(self, adapter, tmp_path):
         test_file = tmp_path / "doc.pdf"
         test_file.write_bytes(b"content")
 
         adapter._app.client.files_upload_v2 = AsyncMock(
             side_effect=RuntimeError("Slack API error")
         )
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "msg_ts"})
 
-        # Should fall back to base class (text message)
         result = await adapter.send_document(
             chat_id="C123",
             file_path=str(test_file),
         )
 
-        # Base class send() is also mocked, so check it was attempted
-        adapter._app.client.chat_postMessage.assert_called_once()
+        assert not result.success
+        assert "Slack document upload failed" in result.error
+        assert str(test_file) in result.error
+        adapter._app.client.chat_postMessage.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_document_with_thread(self, adapter, tmp_path):
@@ -605,6 +609,55 @@ class TestSendDocument:
         assert result.success
         assert adapter._app.client.files_upload_v2.await_count == 2
         sleep_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_final_response_unsafe_media_path_posts_visible_slack_error(
+        self,
+        adapter,
+        tmp_path,
+        monkeypatch,
+    ):
+        unsafe_file = Path("/tmp/report.md")
+        unsafe_file.write_text("report", encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (tmp_path / "safe-media-root",),
+        )
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "msg_ts"})
+        adapter.send_document = AsyncMock(return_value=SendResult(success=True, message_id="doc"))
+        adapter._message_handler = AsyncMock(
+            return_value="Here is the report:\nMEDIA:/tmp/report.md"
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_type="thread",
+            thread_id="parent_ts_123",
+        )
+        event = MessageEvent(
+            text="make report",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="user_ts_123",
+        )
+
+        try:
+            await adapter._process_message_background(event, build_session_key(source))
+        finally:
+            try:
+                unsafe_file.unlink()
+            except FileNotFoundError:
+                pass
+
+        adapter.send_document.assert_not_awaited()
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        call_kwargs = adapter._app.client.chat_postMessage.await_args.kwargs
+        assert call_kwargs["channel"] == "C123"
+        assert call_kwargs["thread_ts"] == "parent_ts_123"
+        assert "Here is the report:" in call_kwargs["text"]
+        assert "Slack file attachment failed" in call_kwargs["text"]
+        assert "MEDIA path is not deliverable: /tmp/report.md" in call_kwargs["text"]
+        assert "~/.hermes/cache/documents/" in call_kwargs["text"]
 
 
 class TestSendPrivateNotice:
@@ -2636,7 +2689,7 @@ class TestFallbackPreservesThreadContext:
         assert call_kwargs.get("thread_ts") == "parent_ts_456"
 
     @pytest.mark.asyncio
-    async def test_send_document_fallback_preserves_thread(self, adapter, tmp_path):
+    async def test_send_document_upload_failure_does_not_fallback_to_text(self, adapter, tmp_path):
         test_file = tmp_path / "report.pdf"
         test_file.write_bytes(b"%PDF-1.4")
 
@@ -2648,15 +2701,16 @@ class TestFallbackPreservesThreadContext:
         )
 
         metadata = {"thread_id": "parent_ts_789"}
-        await adapter.send_document(
+        result = await adapter.send_document(
             chat_id="C123",
             file_path=str(test_file),
             caption="report",
             metadata=metadata,
         )
 
-        call_kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
-        assert call_kwargs.get("thread_ts") == "parent_ts_789"
+        assert not result.success
+        assert "upload failed" in result.error
+        adapter._app.client.chat_postMessage.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_send_image_file_fallback_includes_caption(self, adapter, tmp_path):
